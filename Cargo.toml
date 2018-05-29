@@ -1,0 +1,11 @@
+[package]
+name = "pianozen"
+version = "0.1.0"
+authors = ["Сухарик <suhr@i2pmail.org>"]
+
+[dependencies]
+jack = "*"
+rosc = "0.1"
+
+[dependencies.miosc]
+git = "https://github.com/diaschisma/miosc.git"
