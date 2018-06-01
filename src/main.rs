@@ -53,6 +53,21 @@ impl Adsr {
         }
     }
 
+    fn from_parameters(parameters: Parameters) -> Self {
+        let ms = 1e-3 * parameters.sample_rate;
+
+        let attack = parameters.attack * ms;
+        let decay = parameters.decay * ms;
+        let release = parameters.release * ms;
+
+        let sustain = parameters.sustain;
+
+        Adsr {
+            attack, decay, sustain, release,
+            state: AdsrState::Idle,
+        }
+    }
+
     fn note_on(&mut self) {
         self.state = AdsrState::Press(0)
     }
@@ -132,20 +147,78 @@ impl Filter {
     }
 }
 
+struct Delay {
+    queue: VecDeque<f32>,
+}
+
+impl Delay {
+    fn new(len: usize) -> Self {
+        Delay {
+            queue: vec![0.0; len].into()
+        }
+    }
+    fn signal(&mut self, input: f32) -> f32 {
+        let z_out = self.queue.pop_front().unwrap();
+        self.queue.push_back(input);
+
+        z_out
+    }
+}
+
+struct PowerMeter {
+    left_sum: f32,
+    right_sum: f32,
+    length: usize,
+    counter: usize,
+}
+
+impl PowerMeter {
+    fn new(length: usize) -> Self {
+        PowerMeter {
+            left_sum: 0.0,
+            right_sum: 0.0,
+            length,
+            counter: 0,
+        }
+    }
+    fn power(&mut self, left: f32, right: f32) -> (f32, f32) {
+        self.left_sum += left * left;
+        self.right_sum += right * right;
+
+        self.counter += 1;
+
+        if self.counter == self.length {
+            self.left_sum /= self.length as f32;
+            self.right_sum /= self.length as f32;
+
+            self.counter = 1
+        }
+
+        (
+            self.left_sum / self.counter as f32,
+            self.right_sum / self.counter as f32
+        )
+    }
+}
+
 struct Waveguide {
     queue: VecDeque<f32>,
     filter: Filter,
     leak: f32,
+    pmeter: PowerMeter,
 }
 
 impl Waveguide {
     fn new(wavelength: usize) -> Self {
         let queue = vec![0.0; wavelength * 2].into();
 
+        let pmeter = PowerMeter::new(wavelength);
+
         Waveguide {
             queue,
             filter: Filter::new(),
             leak: 0.995,
+            pmeter
         }
     }
 
@@ -153,9 +226,19 @@ impl Waveguide {
         self.leak = parameters.leak
     }
 
+    fn tune(&mut self, wavelength: f32) {
+        unimplemented!()
+    }
+
     fn signal(&mut self, input: f32) -> f32 {
         let z_out = self.queue.pop_front().unwrap();
-        let z_in = self.leak * self.filter.signal(z_out) + input;
+        let feedback = self.leak * self.filter.signal(z_out);
+
+        let (p_l, p_r) = self.pmeter.power(input, feedback);
+        let p_l = 0.1;
+        let k = (p_l - p_r).max(0.0);
+
+        let z_in = k * input + feedback;
 
         self.queue.push_back(z_in);
 
@@ -163,32 +246,99 @@ impl Waveguide {
     }
 }
 
+fn gate(input: f32, value: f32) -> f32 {
+    if input.abs() < value {
+        input
+    } else {
+        -input
+    }
+}
+
+fn curve(input: f32) -> f32 {
+    if input.abs() > 1.0 {
+        println!("{}", input);
+    }
+
+    input - input.powi(3)
+}
+
+struct Square {
+    period: usize,
+    phase: usize,
+}
+
+impl Square {
+    fn new(wavelength: usize) -> Self {
+        Square {
+            period: wavelength,
+            phase: 0
+        }
+    }
+    fn generate(&mut self) -> f32 {
+        let signal =
+            if self.phase < self.period / 2 {
+                1.0
+            } else {
+                -1.0
+            };
+
+
+        self.phase += 1;
+        if self.phase == self.period {
+            self.phase = 0
+        }
+
+        signal
+    }
+}
+
 struct Synth {
     noise: Noise,
+    square: Square,
     adsr: Adsr,
     waveguide: Waveguide,
+    velocity: f32,
 }
 
 impl Synth {
     fn new() -> Self {
         let noise = Noise::new();
         let adsr = Adsr::new(200.0, 0.0, 0.0, 10000.0);
-        let waveguide = Waveguide::new(100);
+        let waveguide = Waveguide::new(150);
+
+        let square = Square::new(301);
 
         Synth {
-            noise, adsr, waveguide
+            noise, adsr, waveguide, square,
+            velocity: 0.25,
         }
     }
 
     fn from_parameters(parameters: Parameters) -> Self {
-        unimplemented!()
+        let noise = Noise::new();
+        let adsr = Adsr::from_parameters(parameters);
+        let waveguide = Waveguide::new(150);
+
+        let square = Square::new(300);
+        let velocity = parameters.velocity;
+
+        Synth {
+            noise, adsr, waveguide, square, velocity,
+        }
     }
 
     fn load_parameters(&mut self, parameters: Parameters) {
-        self.waveguide.load_parameters(parameters)
+        self.waveguide.load_parameters(parameters);
+
+        let ms = 1e-3 * parameters.sample_rate;
+        let attack = parameters.attack * ms;
+        let decay = parameters.decay * ms;
+
+        self.adsr.attack = attack;
+        self.adsr.decay = decay;
     }
 
-    fn note_on(&mut self) {
+    fn note_on(&mut self, wavelength: f32) {
         self.adsr.note_on()
     }
 
@@ -203,7 +353,7 @@ impl Synth {
         }
 
         for v in buf {
-            let excite = 0.5 * self.noise.generate() * self.adsr.generate();
+            let excite = self.velocity * (0.9 * self.square.generate() + 0.1 * self.noise.generate()) * self.adsr.generate();
             let output = self.waveguide.signal(excite);
 
             *v = output
@@ -221,6 +371,8 @@ struct Parameters {
     decay: f32,
     sustain: f32,
     release: f32,
+
+    velocity: f32,
 }
 
 struct Engine {
@@ -233,14 +385,17 @@ impl Engine {
         let parameters = Parameters {
             sample_rate,
 
-            leak: 0.995,
+            leak: 0.99,
 
-            attack: 200.0,
-            decay: 0.0,
+            attack: 5.0,
+            decay: 10.0,
             sustain: 0.0,
-            release: 0.0,
+            release: 10000.0,
+
+            velocity: 0.25,
         };
-        let synth = Synth::new();
+
+        let synth = Synth::from_parameters(parameters);
 
         Engine {
             synth, parameters
@@ -252,15 +407,40 @@ impl Engine {
 
         if msg.args.is_none() { return }
 
-        match &*msg.addr {
-            "/leak" => {
-                let mut args = msg.args.unwrap();
+        let (addr, mut args) = (msg.addr, msg.args.unwrap());
 
+        match &*addr {
+            "/leak" => {
                 if let Some(Ty::Float(leak)) = args.pop() {
                     self.parameters.leak = leak
                 }
             },
+
+            "/attack" =>
+                if let Some(Ty::Float(attack)) = args.pop() {
+                    self.parameters.attack = attack
+                },
+            "/decay" =>
+                if let Some(Ty::Float(decay)) = args.pop() {
+                    self.parameters.decay = decay
+                },
+            "/sustain" =>
+                if let Some(Ty::Float(sustain)) = args.pop() {
+                    self.parameters.sustain = sustain
+                },
+            "/release" =>
+                if let Some(Ty::Float(release)) = args.pop() {
+                    self.parameters.release = release
+                },
+
+            "/velocity" =>
+                if let Some(Ty::Float(velocity)) = args.pop() {
+                    self.parameters.velocity = velocity
+                },
+
             _ => {
+                let msg =
+                    rosc::OscMessage { addr, args: Some(args) };
                 if let Ok(m) = miosc::into_miosc(msg) {
                     self.process_miosc(m);
                     return
@@ -280,7 +460,7 @@ impl Engine {
 
         match miosc {
             NoteOn(_, _, _) =>
-                self.synth.note_on(),
+                self.synth.note_on(100.0),
             NoteOff(_) =>
                 self.synth.note_off(),
             _ => (),
