@@ -6,126 +6,9 @@ extern crate rosc;
 
 use std::collections::VecDeque;
 
-struct Noise {
-    rand: u32,
-}
+use primitives::*;
 
-impl Noise {
-    fn new() -> Self {
-        // XKCD random number
-        let rand = 4;
-
-        Noise {
-            rand,
-        }
-    }
-    fn generate(&mut self) -> f32 {
-        // BSD variant of the linear congruential method
-        self.rand = self.rand.wrapping_mul(1_103_515_245).wrapping_add(12345);
-        self.rand %= 1 << 31;
-
-        self.rand as f32 / 2_147_483_647.0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum AdsrState {
-    Idle,
-    Press(u32),
-    Sustain,
-    Release(u32),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Adsr {
-    attack: f32,
-    decay: f32,
-    sustain: f32,
-    release: f32,
-    state: AdsrState,
-}
-
-impl Adsr {
-    fn new(attack: f32, decay: f32, sustain: f32, release: f32) -> Self {
-        Adsr {
-            attack, decay, sustain, release,
-            state: AdsrState::Idle,
-        }
-    }
-
-    fn from_parameters(parameters: Parameters) -> Self {
-        let ms = 1e-3 * parameters.sample_rate;
-
-        let attack = parameters.attack * ms;
-        let decay = parameters.decay * ms;
-        let release = parameters.release * ms;
-
-        let sustain = parameters.sustain;
-
-        Adsr {
-            attack, decay, sustain, release,
-            state: AdsrState::Idle,
-        }
-    }
-
-    fn note_on(&mut self) {
-        self.state = AdsrState::Press(0)
-    }
-
-    fn note_off(&mut self) {
-        self.state = AdsrState::Release(0)
-    }
-
-    fn is_active(&self) -> bool {
-        self.state != AdsrState::Idle
-    }
-
-    fn increment_state(&mut self) {
-        match self.state {
-            AdsrState::Press(ref mut t) =>
-                *t += 1,
-            AdsrState::Release(ref mut t) =>
-                *t += 1,
-            _ => ()
-        }
-    }
-
-    fn generate(&mut self) -> f32 {
-        let adsr =
-            match self.state {
-                AdsrState::Idle =>
-                    0.0,
-                AdsrState::Press(mut t) if (t as f32) < self.attack => {
-                    t as f32 / self.attack
-                },
-                AdsrState::Press(t) => {
-                    let t = t as f32 - self.attack;
-
-                    if t < self.decay {
-                        1.0 - t * (1.0 - self.sustain) / self.decay
-                    } else {
-                        self.state = AdsrState::Sustain;
-
-                        self.sustain
-                    }
-                },
-                AdsrState::Sustain =>
-                    self.sustain,
-                AdsrState::Release(t) =>
-                    if (t as f32) < self.release {
-                        self.sustain * (1.0 - t as f32 / self.release)
-                    } else {
-                        self.state = AdsrState::Idle;
-
-                        0.0
-                    }
-            };
-
-        self.increment_state();
-
-        adsr
-    }
-}
+mod primitives;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct Filter {
@@ -147,27 +30,8 @@ impl Filter {
     }
 }
 
-struct Delay {
-    queue: VecDeque<f32>,
-}
-
-impl Delay {
-    fn new(len: usize) -> Self {
-        Delay {
-            queue: vec![0.0; len].into()
-        }
-    }
-    fn signal(&mut self, input: f32) -> f32 {
-        let z_out = self.queue.pop_front().unwrap();
-        self.queue.push_back(input);
-
-        z_out
-    }
-}
-
 struct PowerMeter {
-    left_sum: f32,
-    right_sum: f32,
+    sum: f32,
     length: usize,
     counter: usize,
 }
@@ -175,29 +39,54 @@ struct PowerMeter {
 impl PowerMeter {
     fn new(length: usize) -> Self {
         PowerMeter {
-            left_sum: 0.0,
-            right_sum: 0.0,
+            sum: 0.0,
             length,
             counter: 0,
         }
     }
-    fn power(&mut self, left: f32, right: f32) -> (f32, f32) {
-        self.left_sum += left * left;
-        self.right_sum += right * right;
-
+    fn feed(&mut self, input: f32) {
+        self.sum += input * input;
         self.counter += 1;
 
         if self.counter == self.length {
-            self.left_sum /= self.length as f32;
-            self.right_sum /= self.length as f32;
-
+            self.sum /= self.length as f32;
             self.counter = 1
         }
+    }
+    fn power(&self) -> f32 {
+        self.sum / self.counter as f32
+    }
+}
 
-        (
-            self.left_sum / self.counter as f32,
-            self.right_sum / self.counter as f32
-        )
+struct Lagrange5Fd {
+    ks: [f32; 6],
+    zs: VecDeque<f32>,
+}
+
+impl Lagrange5Fd {
+    fn compute_ks(delay: f32) -> [f32; 6] {
+        let mut ks = [1.0; 6];
+
+        for (n, k) in ks.iter_mut().enumerate() {
+            for i in 0..=5 {
+                if i == n { continue }
+
+                *k *= (delay - i as f32) / (n as f32 - i as f32)
+            }
+        }
+
+        ks
+    }
+
+    fn new(delay: f32) -> Self {
+        let ks = Lagrange5Fd::compute_ks(delay);
+        let zs = vec![0.0; 5].into();
+
+        Lagrange5Fd { ks, zs }
+    }
+
+    fn signal(&mut self, input: f32) -> f32 {
+        unimplemented!()
     }
 }
 
@@ -205,20 +94,16 @@ struct Waveguide {
     queue: VecDeque<f32>,
     filter: Filter,
     leak: f32,
-    pmeter: PowerMeter,
 }
 
 impl Waveguide {
     fn new(wavelength: usize) -> Self {
         let queue = vec![0.0; wavelength * 2].into();
 
-        let pmeter = PowerMeter::new(wavelength);
-
         Waveguide {
             queue,
             filter: Filter::new(),
             leak: 0.995,
-            pmeter
         }
     }
 
@@ -230,15 +115,15 @@ impl Waveguide {
         unimplemented!()
     }
 
+    fn tap(&self) -> f32 {
+        *self.queue.back().unwrap()
+    }
+
     fn signal(&mut self, input: f32) -> f32 {
         let z_out = self.queue.pop_front().unwrap();
         let feedback = self.leak * self.filter.signal(z_out);
 
-        let (p_l, p_r) = self.pmeter.power(input, feedback);
-        let p_l = 0.1;
-        let k = (p_l - p_r).max(0.0);
-
-        let z_in = k * input + feedback;
+        let z_in = input + feedback;
 
         self.queue.push_back(z_in);
 
@@ -246,46 +131,77 @@ impl Waveguide {
     }
 }
 
-fn gate(input: f32, value: f32) -> f32 {
-    if input.abs() < value {
-        input
-    } else {
-        -input
-    }
+struct Exciter {
+    noise: Noise,
+    square: Square,
+    adsr: Adsr,
+    pmeter: PowerMeter,
+
+    velocity: f32,
 }
 
-fn curve(input: f32) -> f32 {
-    if input.abs() > 1.0 {
-        println!("{}", input);
+impl Exciter {
+    fn new() -> Self {
+        unimplemented!()
     }
 
-    input - input.powi(3)
+    fn from_parameters(parameters: Parameters) -> Self {
+        let adsr = Adsr::from_parameters(parameters);
+        let velocity = parameters.velocity.sqrt();
+
+        let noise = Noise::new();
+        let square = Square::new(149.5);
+        let pmeter = PowerMeter::new(150);
+
+        Exciter {
+            noise, square, pmeter,
+            adsr, velocity
+        }
+    }
+
+    fn load_parameters(&mut self, parameters: Parameters) {
+        self.adsr.load_parameters(parameters);
+        self.velocity = parameters.velocity.sqrt();
+    }
+
+    fn signal(&mut self, input: f32) -> f32 {
+        let excite = self.velocity * (0.9 * self.square.generate() + 0.1 * self.noise.generate()) * self.adsr.generate();
+        self.pmeter.feed(input);
+
+        let p_r = self.pmeter.power();
+        let p_l = self.velocity.powi(2);
+        let k = (p_l - p_r).max(0.0);
+
+        k * excite
+    }
 }
 
 struct Square {
-    period: usize,
-    phase: usize,
+    period: f32,
+    phase: f32,
 }
 
 impl Square {
-    fn new(wavelength: usize) -> Self {
+    fn new(wavelength: f32) -> Self {
         Square {
             period: wavelength,
-            phase: 0
+            phase: 0.0
         }
     }
+
     fn generate(&mut self) -> f32 {
+        let half = 0.5 * self.period;
         let signal =
-            if self.phase < self.period / 2 {
-                1.0
+            if self.phase < half {
+                1.0 - 2.0 * self.phase / half
             } else {
-                -1.0
+                1.0 - 2.0 * (self.period - self.phase) / half
             };
 
 
-        self.phase += 1;
-        if self.phase == self.period {
-            self.phase = 0
+        self.phase += 1.0;
+        if self.phase >= self.period {
+            self.phase -= self.period
         }
 
         signal
@@ -293,67 +209,55 @@ impl Square {
 }
 
 struct Synth {
-    noise: Noise,
-    square: Square,
-    adsr: Adsr,
+    exciter: Exciter,
     waveguide: Waveguide,
-    velocity: f32,
 }
 
 impl Synth {
     fn new() -> Self {
-        let noise = Noise::new();
-        let adsr = Adsr::new(200.0, 0.0, 0.0, 10000.0);
+        let exciter = Exciter::new();
         let waveguide = Waveguide::new(150);
 
-        let square = Square::new(301);
-
         Synth {
-            noise, adsr, waveguide, square,
-            velocity: 0.25,
+            exciter, waveguide,
         }
     }
 
     fn from_parameters(parameters: Parameters) -> Self {
-        let noise = Noise::new();
-        let adsr = Adsr::from_parameters(parameters);
+        let exciter = Exciter::from_parameters(parameters);
         let waveguide = Waveguide::new(150);
 
-        let square = Square::new(300);
-        let velocity = parameters.velocity;
-
         Synth {
-            noise, adsr, waveguide, square, velocity,
+            exciter, waveguide,
         }
     }
 
     fn load_parameters(&mut self, parameters: Parameters) {
+        self.exciter.load_parameters(parameters);
         self.waveguide.load_parameters(parameters);
-
-        let ms = 1e-3 * parameters.sample_rate;
-        let attack = parameters.attack * ms;
-        let decay = parameters.decay * ms;
-
-        self.adsr.attack = attack;
-        self.adsr.decay = decay;
     }
 
     fn note_on(&mut self, wavelength: f32) {
-        self.adsr.note_on()
+        self.exciter.adsr.note_on()
     }
 
     fn note_off(&mut self) {
-        self.adsr.note_off()
+        self.exciter.adsr.note_off()
+    }
+
+    fn is_alive(&self) -> bool {
+        self.exciter.adsr.is_active() || self.exciter.pmeter.power() > 1e-16
     }
 
     fn fill_buf(&mut self, buf: &mut [f32]) {
-        if !self.adsr.is_active() {
+        if !self.exciter.adsr.is_active() {
             for v in buf { *v = 0.0 }
             return
         }
 
         for v in buf {
-            let excite = self.velocity * (0.9 * self.square.generate() + 0.1 * self.noise.generate()) * self.adsr.generate();
+            let tap = self.waveguide.tap();
+            let excite = self.exciter.signal(tap);
             let output = self.waveguide.signal(excite);
 
             *v = output
@@ -362,17 +266,17 @@ impl Synth {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Parameters {
-    sample_rate: f32,
+pub struct Parameters {
+    pub sample_rate: f32,
 
-    leak: f32,
+    pub leak: f32,
 
-    attack: f32,
-    decay: f32,
-    sustain: f32,
-    release: f32,
+    pub attack: f32,
+    pub decay: f32,
+    pub sustain: f32,
+    pub release: f32,
 
-    velocity: f32,
+    pub velocity: f32,
 }
 
 struct Engine {
