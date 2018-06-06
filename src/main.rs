@@ -10,6 +10,8 @@ use primitives::*;
 
 mod primitives;
 
+const MIDI_0: f32 = 8.1757989156;
+
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct Filter {
     z1: f32,
@@ -85,23 +87,39 @@ impl Lagrange5Fd {
         Lagrange5Fd { ks, zs }
     }
 
+    fn tune(&mut self, delay: f32) {
+        self.ks = Lagrange5Fd::compute_ks(delay)
+    }
+
     fn signal(&mut self, input: f32) -> f32 {
-        unimplemented!()
+        let mut s = self.ks[0] * input;
+
+        for i in 1..6 {
+            s += self.ks[i] * self.zs[i - 1]
+        }
+
+        drop(self.zs.pop_back());
+        self.zs.push_front(input);
+
+        s
     }
 }
 
 struct Waveguide {
     queue: VecDeque<f32>,
+    delay: Lagrange5Fd,
     filter: Filter,
     leak: f32,
 }
 
 impl Waveguide {
     fn new(wavelength: usize) -> Self {
-        let queue = vec![0.0; wavelength * 2].into();
+        let queue = vec![0.0; wavelength - 3].into();
+        let delay = Lagrange5Fd::new(2.5);
 
         Waveguide {
             queue,
+            delay,
             filter: Filter::new(),
             leak: 0.995,
         }
@@ -112,7 +130,10 @@ impl Waveguide {
     }
 
     fn tune(&mut self, wavelength: f32) {
-        unimplemented!()
+        let len = wavelength - 3.0;
+
+        self.queue.resize(len as _, 0.0);
+        self.delay.tune(2.5 + len.fract());
     }
 
     fn tap(&self) -> f32 {
@@ -121,6 +142,7 @@ impl Waveguide {
 
     fn signal(&mut self, input: f32) -> f32 {
         let z_out = self.queue.pop_front().unwrap();
+        let z_out = self.delay.signal(z_out);
         let feedback = self.leak * self.filter.signal(z_out);
 
         let z_in = input + feedback;
@@ -150,7 +172,7 @@ impl Exciter {
         let velocity = parameters.velocity.sqrt();
 
         let noise = Noise::new();
-        let square = Square::new(149.5);
+        let square = Square::new(150.0);
         let pmeter = PowerMeter::new(150);
 
         Exciter {
@@ -164,8 +186,14 @@ impl Exciter {
         self.velocity = parameters.velocity.sqrt();
     }
 
+    fn tune(&mut self, wavelength: f32) {
+        self.square.period = wavelength;
+        self.pmeter.length = wavelength as _;
+    }
+
     fn signal(&mut self, input: f32) -> f32 {
-        let excite = self.velocity * (0.9 * self.square.generate() + 0.1 * self.noise.generate()) * self.adsr.generate();
+        let source = 0.90 * self.square.generate() + 0.10 * self.noise.generate();
+        let excite = self.velocity * source * self.adsr.generate();
         self.pmeter.feed(input);
 
         let p_r = self.pmeter.power();
@@ -197,7 +225,6 @@ impl Square {
             } else {
                 1.0 - 2.0 * (self.period - self.phase) / half
             };
-
 
         self.phase += 1.0;
         if self.phase >= self.period {
@@ -238,6 +265,9 @@ impl Synth {
     }
 
     fn note_on(&mut self, wavelength: f32) {
+        self.exciter.tune(wavelength);
+        self.waveguide.tune(wavelength);
+
         self.exciter.adsr.note_on()
     }
 
@@ -263,6 +293,20 @@ impl Synth {
             *v = output
         }
     }
+
+    fn add_to_buf(&mut self, buf: &mut [f32]) {
+        if !self.is_alive() {
+            return
+        }
+
+        for v in buf {
+            let tap = self.waveguide.tap();
+            let excite = self.exciter.signal(tap);
+            let output = self.waveguide.signal(excite);
+
+            *v += output
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -280,7 +324,7 @@ pub struct Parameters {
 }
 
 struct Engine {
-    synth: Synth,
+    synths: Vec<(i32, Synth)>,
     parameters: Parameters,
 }
 
@@ -299,10 +343,9 @@ impl Engine {
             velocity: 0.25,
         };
 
-        let synth = Synth::from_parameters(parameters);
-
+        let synths = vec![];
         Engine {
-            synth, parameters
+            synths, parameters
         }
     }
 
@@ -356,23 +399,43 @@ impl Engine {
     }
 
     fn update(&mut self) {
-        self.synth.load_parameters(self.parameters)
+        for (_, s) in &mut self.synths {
+            s.load_parameters(self.parameters)
+        }
     }
 
     fn process_miosc(&mut self, miosc: miosc::MioscMessage) {
         use miosc::MioscMessage::*;
 
         match miosc {
-            NoteOn(_, _, _) =>
-                self.synth.note_on(100.0),
-            NoteOff(_) =>
-                self.synth.note_off(),
+            NoteOn(id, pitch, _) => {
+                let reference = self.parameters.sample_rate / MIDI_0;
+                let ratio = (pitch / 12.0).exp2();
+
+                if let Some((_, s)) = self.synths.iter_mut().find(|(i, _)| *i == id) {
+                    s.note_on(reference / ratio);
+                    return
+                }
+
+                let mut synth = Synth::from_parameters(self.parameters);
+                synth.note_on(reference / ratio);
+                self.synths.push((id, synth))
+            },
+            NoteOff(id) => {
+                if let Some((_, s)) = self.synths.iter_mut().find(|(i, _)| *i == id) {
+                    s.note_off()
+                };
+            },
             _ => (),
         }
     }
 
     fn fill_buf(&mut self, buf: &mut [f32]) {
-        self.synth.fill_buf(buf)
+        for v in buf.iter_mut() { *v = 0.0 }
+
+        for (_, s) in &mut self.synths {
+            s.add_to_buf(buf);
+        }
     }
 }
 
