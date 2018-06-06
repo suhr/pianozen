@@ -67,15 +67,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pianozen"
-version = "0.1.0"
-dependencies = [
- "jack 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "miosc 0.1.0 (git+https://github.com/diaschisma/miosc.git)",
- "rosc 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
-]
-
-[[package]]
 name = "rosc"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -92,6 +83,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 name = "winapi-build"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "xephys"
+version = "0.1.0"
+dependencies = [
+ "jack 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "miosc 0.1.0 (git+https://github.com/diaschisma/miosc.git)",
+ "rosc 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
+]
 
 [metadata]
 "checksum bitflags 1.0.3 (registry+https://github.com/rust-lang/crates.io-index)" = "d0c54bb8f454c567f21197eefcdbf5679d0bd99f2ddbe52e84c77061952e6789"
