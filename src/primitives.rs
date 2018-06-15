@@ -69,9 +69,12 @@ impl Adsr {
         let ms = 1e-3 * parameters.sample_rate;
         let attack = parameters.attack * ms;
         let decay = parameters.decay * ms;
+        let release = parameters.release * ms;
 
         self.attack = attack;
         self.decay = decay;
+        self.sustain = parameters.sustain;
+        self.release = release;
     }
 
     pub fn note_on(&mut self) {

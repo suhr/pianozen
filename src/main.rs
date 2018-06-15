@@ -14,19 +14,30 @@ const MIDI_0: f32 = 8.1757989156;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct Filter {
+    a1: f32,
     z1: f32,
 }
 
 impl Filter {
     fn new() -> Self {
         Filter {
+            a1: 0.15,
             z1: 0.0,
         }
     }
 
+    fn delay(&self, wavelength: f32) -> f32 {
+        let omega = 2.0 * ::std::f32::consts::PI / wavelength;
+
+        let a1 = self.a1;
+        let frac = a1 * omega.sin() / (1.0 - a1 * omega.cos());
+
+        frac.atan() / omega
+    }
+
     fn signal(&mut self, input: f32) -> f32 {
-        let output = 0.5 * (input + self.z1);
-        self.z1 = input;
+        let output = input * (1.0 - self.a1) + self.z1 * self.a1;
+        self.z1 = output;
 
         output
     }
@@ -105,11 +116,52 @@ impl Lagrange5Fd {
     }
 }
 
+struct Damper {
+    is_off: bool,
+    damping: f32,
+    counter: f32,
+}
+
+impl Damper {
+    fn new() -> Self {
+        Damper {
+            is_off: true,
+            damping: 0.05,
+            counter: 0.0,
+        }
+    }
+
+    fn activate(&mut self) {
+        self.is_off = false
+    }
+
+    fn deactivate(&mut self) {
+        self.is_off = true;
+        self.counter = 0.0
+    }
+
+    fn signal(&mut self, input: f32) -> f32 {
+        if self.is_off {
+            input
+        } else {
+            if self.counter >= 440.0 {
+                (1.0 - self.damping) * input
+            } else {
+                let k = self.damping * self.counter / 440.0;
+
+                self.counter += 1.0;
+                (1.0 - k) * input
+            }
+        }
+    }
+}
+
 struct Waveguide {
     queue: VecDeque<f32>,
     delay: Lagrange5Fd,
     filter: Filter,
     leak: f32,
+    damper: Damper,
 }
 
 impl Waveguide {
@@ -121,16 +173,35 @@ impl Waveguide {
             queue,
             delay,
             filter: Filter::new(),
-            leak: 0.995,
+            leak: 0.994,
+            damper: Damper::new(),
         }
     }
 
+    fn from_parameters(parameters: Parameters) -> Self {
+        let mut waveguide = Waveguide::new(150);
+        waveguide.load_parameters(parameters);
+
+        waveguide
+    }
+
     fn load_parameters(&mut self, parameters: Parameters) {
-        self.leak = parameters.leak
+        self.leak = parameters.leak;
+        self.damper.damping = parameters.release_damping;
+        self.filter.a1 = parameters.cutoff
+    }
+
+    fn note_on(&mut self) {
+        self.damper.deactivate()
+    }
+
+    fn note_off(&mut self) {
+        self.damper.activate()
     }
 
     fn tune(&mut self, wavelength: f32) {
-        let len = wavelength - 3.0;
+        let fd = 2.5 + self.filter.delay(wavelength);
+        let len = wavelength - fd;
 
         self.queue.resize(len as _, 0.0);
         self.delay.tune(2.5 + len.fract());
@@ -141,9 +212,11 @@ impl Waveguide {
     }
 
     fn signal(&mut self, input: f32) -> f32 {
+        let leak = self.damper.signal(self.leak);
+
         let z_out = self.queue.pop_front().unwrap();
         let z_out = self.delay.signal(z_out);
-        let feedback = self.leak * self.filter.signal(z_out);
+        let feedback = leak * self.filter.signal(z_out);
 
         let z_in = input + feedback;
 
@@ -158,8 +231,10 @@ struct Exciter {
     square: Square,
     adsr: Adsr,
     pmeter: PowerMeter,
+    //filter: Filter,
 
     velocity: f32,
+    noise_ratio: f32,
 }
 
 impl Exciter {
@@ -170,29 +245,34 @@ impl Exciter {
     fn from_parameters(parameters: Parameters) -> Self {
         let adsr = Adsr::from_parameters(parameters);
         let velocity = parameters.velocity.sqrt();
+        let noise_ratio = parameters.noise;
 
         let noise = Noise::new();
         let square = Square::new(150.0);
-        let pmeter = PowerMeter::new(150);
+        let pmeter = PowerMeter::new(1100);
+
+        //let filter = Filter::new();
 
         Exciter {
-            noise, square, pmeter,
-            adsr, velocity
+            noise, square, pmeter, //filter,
+            adsr, velocity, noise_ratio
         }
     }
 
     fn load_parameters(&mut self, parameters: Parameters) {
         self.adsr.load_parameters(parameters);
         self.velocity = parameters.velocity.sqrt();
+        self.noise_ratio = parameters.noise;
     }
 
     fn tune(&mut self, wavelength: f32) {
         self.square.period = wavelength;
-        self.pmeter.length = wavelength as _;
+        //self.pmeter.length = wavelength as _;
     }
 
     fn signal(&mut self, input: f32) -> f32 {
-        let source = 0.90 * self.square.generate() + 0.10 * self.noise.generate();
+        let nsr = self.noise_ratio;
+        let source = (1.0 - nsr) * self.square.generate() + nsr * self.noise.generate();
         let excite = self.velocity * source * self.adsr.generate();
         self.pmeter.feed(input);
 
@@ -252,7 +332,7 @@ impl Synth {
 
     fn from_parameters(parameters: Parameters) -> Self {
         let exciter = Exciter::from_parameters(parameters);
-        let waveguide = Waveguide::new(150);
+        let waveguide = Waveguide::from_parameters(parameters);
 
         Synth {
             exciter, waveguide,
@@ -268,11 +348,13 @@ impl Synth {
         self.exciter.tune(wavelength);
         self.waveguide.tune(wavelength);
 
-        self.exciter.adsr.note_on()
+        self.exciter.adsr.note_on();
+        self.waveguide.note_on();
     }
 
     fn note_off(&mut self) {
-        self.exciter.adsr.note_off()
+        self.exciter.adsr.note_off();
+        self.waveguide.note_off();
     }
 
     fn is_alive(&self) -> bool {
@@ -321,6 +403,9 @@ pub struct Parameters {
     pub release: f32,
 
     pub velocity: f32,
+    pub noise: f32,
+    pub release_damping: f32,
+    pub cutoff: f32,
 }
 
 struct Engine {
@@ -333,7 +418,7 @@ impl Engine {
         let parameters = Parameters {
             sample_rate,
 
-            leak: 0.99,
+            leak: 0.994,
 
             attack: 5.0,
             decay: 10.0,
@@ -341,6 +426,9 @@ impl Engine {
             release: 10000.0,
 
             velocity: 0.25,
+            noise: 0.15,
+            release_damping: 0.04,
+            cutoff: 0.15,
         };
 
         let synths = vec![];
@@ -383,6 +471,18 @@ impl Engine {
             "/velocity" =>
                 if let Some(Ty::Float(velocity)) = args.pop() {
                     self.parameters.velocity = velocity
+                },
+            "/noise" =>
+                if let Some(Ty::Float(noise)) = args.pop() {
+                    self.parameters.noise = noise
+                },
+            "/release_damping" =>
+                if let Some(Ty::Float(release_damping)) = args.pop() {
+                    self.parameters.release_damping = release_damping
+                },
+            "/cutoff" =>
+                if let Some(Ty::Float(cutoff)) = args.pop() {
+                    self.parameters.cutoff = cutoff
                 },
 
             _ => {
@@ -470,7 +570,7 @@ fn read_osc(socket: &::std::net::UdpSocket) -> Result<rosc::OscMessage, OscIoErr
 }
 
 fn main() {
-    let (client, _status) = jack::Client::new("pianozen", jack::ClientOptions::NO_START_SERVER).unwrap();
+    let (client, _status) = jack::Client::new("xephys", jack::ClientOptions::NO_START_SERVER).unwrap();
     let mut out_port = client.register_port("mono", jack::AudioOut::default()).unwrap();
 
     let (tx, rx) = ::std::sync::mpsc::channel();
