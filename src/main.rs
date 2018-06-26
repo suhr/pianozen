@@ -13,6 +13,138 @@ mod primitives;
 const MIDI_0: f32 = 8.1757989156;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
+pub enum OscType {
+    Triangle,
+    Square,
+    Sine,
+}
+
+impl OscType {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "triangle" =>
+                Some(OscType::Triangle),
+            "square" =>
+                Some(OscType::Square),
+            "sine" =>
+                Some(OscType::Sine),
+            _ => None,
+        }
+    }
+}
+
+// A very naive oscillator
+struct Oscillator {
+    kind: OscType,
+    period: f32,
+    phase: f32,
+    half_width: f32,
+}
+
+impl Oscillator {
+    fn new() -> Self {
+        Oscillator {
+            kind: OscType::Triangle,
+            period: 150.0,
+            phase: 0.0,
+            half_width: 1.0,
+        }
+    }
+
+    fn triangle(&self, phase: f32) -> f32 {
+        if phase < 0.5 {
+            1.0 - 4.0 * phase
+        } else {
+            1.0 - 4.0 * (1.0 - phase)
+        }
+    }
+
+    fn square(&self, phase: f32) -> f32 {
+        if phase < 0.5 {
+            1.0
+        } else {
+            -1.0
+        }
+    }
+
+    fn sine(&self, phase: f32) -> f32 {
+        (2.0 * ::std::f32::consts::PI * phase).sin()
+    }
+
+    fn generate(&mut self) -> f32 {
+        let half = 0.5 * self.period;
+        let w = self.half_width;
+
+        let phase =
+            if self.phase < half * w {
+                self.phase / (w * self.period)
+            } else {
+                (0.5 * w + (self.phase - half * w) / ((2.0 - w) * self.period)).fract()
+            };
+
+        debug_assert!(phase.abs() <= 1.0);
+
+        let signal =
+            match self.kind {
+                OscType::Triangle => self.triangle(phase),
+                OscType::Square => self.square(phase),
+                OscType::Sine => self.sine(phase),
+            };
+
+        self.phase += 1.0;
+        if self.phase >= self.period {
+            self.phase -= self.period
+        }
+
+        debug_assert!(signal.abs() <= 1.0);
+        signal
+    }
+}
+
+struct Oscs {
+    osc1: Oscillator,
+    osc2: Oscillator,
+
+    tune1: f32,
+    tune2: f32,
+    mix: f32,
+}
+
+impl Oscs {
+    fn new() -> Self {
+        let osc1 = Oscillator::new();
+        let osc2 = Oscillator::new();
+
+        Oscs {
+            osc1, osc2,
+            tune1: 1.0,
+            tune2: 1.0,
+            mix: 0.0,
+        }
+    }
+
+    fn load_parameters(&mut self, parameters: Parameters) {
+        self.osc1.kind = parameters.osc1_type;
+        self.osc2.kind = parameters.osc2_type;
+        self.osc1.half_width = parameters.osc1_width;
+        self.osc2.half_width = parameters.osc2_width;
+        self.tune1 = (parameters.osc1_tune / 12.0).exp2();
+        self.tune2 = (parameters.osc2_tune / 12.0).exp2();
+        self.mix = parameters.oscs_mix
+    }
+
+    fn tune(&mut self, wavelength: f32) {
+        self.osc1.period = wavelength * self.tune1;
+        self.osc2.period = wavelength * self.tune2;
+    }
+
+    fn generate(&mut self) -> f32 {
+        (1.0 - self.mix) * self.osc1.generate()
+        + self.mix * self.osc2.generate()
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
 struct Filter {
     a1: f32,
     z1: f32,
@@ -187,7 +319,7 @@ impl Waveguide {
 
     fn load_parameters(&mut self, parameters: Parameters) {
         self.leak = parameters.leak;
-        self.damper.damping = parameters.release_damping;
+        self.damper.damping = parameters.damper;
         self.filter.a1 = parameters.cutoff
     }
 
@@ -228,7 +360,7 @@ impl Waveguide {
 
 struct Exciter {
     noise: Noise,
-    square: Square,
+    oscs: Oscs,
     adsr: Adsr,
     pmeter: PowerMeter,
     //filter: Filter,
@@ -248,31 +380,31 @@ impl Exciter {
         let noise_ratio = parameters.noise;
 
         let noise = Noise::new();
-        let square = Square::new(150.0);
+        let mut oscs = Oscs::new();
         let pmeter = PowerMeter::new(1100);
 
-        //let filter = Filter::new();
+        oscs.load_parameters(parameters);
 
         Exciter {
-            noise, square, pmeter, //filter,
+            noise, oscs, pmeter,
             adsr, velocity, noise_ratio
         }
     }
 
     fn load_parameters(&mut self, parameters: Parameters) {
         self.adsr.load_parameters(parameters);
+        self.oscs.load_parameters(parameters);
         self.velocity = parameters.velocity.sqrt();
         self.noise_ratio = parameters.noise;
     }
 
     fn tune(&mut self, wavelength: f32) {
-        self.square.period = wavelength;
-        //self.pmeter.length = wavelength as _;
+        self.oscs.tune(wavelength)
     }
 
     fn signal(&mut self, input: f32) -> f32 {
         let nsr = self.noise_ratio;
-        let source = (1.0 - nsr) * self.square.generate() + nsr * self.noise.generate();
+        let source = (1.0 - nsr) * self.oscs.generate() + nsr * self.noise.generate();
         let excite = self.velocity * source * self.adsr.generate();
         self.pmeter.feed(input);
 
@@ -281,37 +413,6 @@ impl Exciter {
         let k = (p_l - p_r).max(0.0);
 
         k * excite
-    }
-}
-
-struct Square {
-    period: f32,
-    phase: f32,
-}
-
-impl Square {
-    fn new(wavelength: f32) -> Self {
-        Square {
-            period: wavelength,
-            phase: 0.0
-        }
-    }
-
-    fn generate(&mut self) -> f32 {
-        let half = 0.5 * self.period;
-        let signal =
-            if self.phase < half {
-                1.0 - 2.0 * self.phase / half
-            } else {
-                1.0 - 2.0 * (self.period - self.phase) / half
-            };
-
-        self.phase += 1.0;
-        if self.phase >= self.period {
-            self.phase -= self.period
-        }
-
-        signal
     }
 }
 
@@ -395,7 +496,13 @@ impl Synth {
 pub struct Parameters {
     pub sample_rate: f32,
 
-    pub leak: f32,
+    pub osc1_type: OscType,
+    pub osc2_type: OscType,
+    pub osc1_width: f32,
+    pub osc2_width: f32,
+    pub osc1_tune: f32,
+    pub osc2_tune: f32,
+    pub oscs_mix: f32,
 
     pub attack: f32,
     pub decay: f32,
@@ -404,7 +511,9 @@ pub struct Parameters {
 
     pub velocity: f32,
     pub noise: f32,
-    pub release_damping: f32,
+
+    pub leak: f32,
+    pub damper: f32,
     pub cutoff: f32,
 }
 
@@ -418,7 +527,13 @@ impl Engine {
         let parameters = Parameters {
             sample_rate,
 
-            leak: 0.994,
+            osc1_type: OscType::Triangle,
+            osc2_type: OscType::Triangle,
+            osc1_width: 1.0,
+            osc2_width: 1.0,
+            osc1_tune: 1.0,
+            osc2_tune: 1.0,
+            oscs_mix: 0.0,
 
             attack: 5.0,
             decay: 10.0,
@@ -427,7 +542,9 @@ impl Engine {
 
             velocity: 0.25,
             noise: 0.15,
-            release_damping: 0.04,
+
+            leak: 0.994,
+            damper: 0.04,
             cutoff: 0.15,
         };
 
@@ -445,11 +562,41 @@ impl Engine {
         let (addr, mut args) = (msg.addr, msg.args.unwrap());
 
         match &*addr {
-            "/leak" => {
-                if let Some(Ty::Float(leak)) = args.pop() {
-                    self.parameters.leak = leak
+            "/osc1_type" => {
+                if let Some(Ty::String(s)) = args.pop() {
+                    if let Some(ty) = OscType::from_str(&s) {
+                        self.parameters.osc1_type = ty
+                    }
                 }
             },
+            "/osc2_type" => {
+                if let Some(Ty::String(s)) = args.pop() {
+                    if let Some(ty) = OscType::from_str(&s) {
+                        self.parameters.osc2_type = ty
+                    }
+                }
+            },
+            "/osc1_width" =>
+                if let Some(Ty::Float(osc1_width)) = args.pop() {
+                    self.parameters.osc1_width = osc1_width
+                },
+            "/osc2_width" =>
+                if let Some(Ty::Float(osc2_width)) = args.pop() {
+                    self.parameters.osc2_width = osc2_width
+                },
+            "/osc1_tune" =>
+                if let Some(Ty::Float(osc1_tune)) = args.pop() {
+                    self.parameters.osc1_tune = osc1_tune
+                },
+            "/osc2_tune" =>
+                if let Some(Ty::Float(osc2_tune)) = args.pop() {
+                    self.parameters.osc2_tune = osc2_tune
+                },
+            "/oscs_mix" =>
+                if let Some(Ty::Float(oscs_mix)) = args.pop() {
+                    self.parameters.oscs_mix = oscs_mix
+                },
+
 
             "/attack" =>
                 if let Some(Ty::Float(attack)) = args.pop() {
@@ -476,9 +623,15 @@ impl Engine {
                 if let Some(Ty::Float(noise)) = args.pop() {
                     self.parameters.noise = noise
                 },
-            "/release_damping" =>
-                if let Some(Ty::Float(release_damping)) = args.pop() {
-                    self.parameters.release_damping = release_damping
+
+            "/leak" => {
+                if let Some(Ty::Float(leak)) = args.pop() {
+                    self.parameters.leak = leak
+                }
+            },
+            "/damper" =>
+                if let Some(Ty::Float(damper)) = args.pop() {
+                    self.parameters.damper = damper
                 },
             "/cutoff" =>
                 if let Some(Ty::Float(cutoff)) = args.pop() {
