@@ -376,7 +376,7 @@ impl Exciter {
 
     fn from_parameters(parameters: Parameters) -> Self {
         let adsr = Adsr::from_parameters(parameters);
-        let velocity = parameters.velocity.sqrt();
+        let velocity = parameters.velocity.powf(1.5);
         let noise_ratio = parameters.noise;
 
         let noise = Noise::new();
@@ -394,7 +394,7 @@ impl Exciter {
     fn load_parameters(&mut self, parameters: Parameters) {
         self.adsr.load_parameters(parameters);
         self.oscs.load_parameters(parameters);
-        self.velocity = parameters.velocity.sqrt();
+        self.velocity = parameters.velocity.powf(1.5);
         self.noise_ratio = parameters.noise;
     }
 
@@ -405,11 +405,11 @@ impl Exciter {
     fn signal(&mut self, input: f32) -> f32 {
         let nsr = self.noise_ratio;
         let source = (1.0 - nsr) * self.oscs.generate() + nsr * self.noise.generate();
-        let excite = self.velocity * source * self.adsr.generate();
+        let excite = source * self.adsr.generate();
         self.pmeter.feed(input);
 
-        let p_r = self.pmeter.power();
-        let p_l = self.velocity.powi(2);
+        let p_r = self.pmeter.power().sqrt();
+        let p_l = self.velocity;
         let k = (p_l - p_r).max(0.0);
 
         k * excite
