@@ -11,6 +11,7 @@ use primitives::*;
 mod primitives;
 
 const MIDI_0: f32 = 8.1757989156;
+const MIDI_60: f32 = MIDI_0 * 32.0;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum OscType {
@@ -293,6 +294,9 @@ struct Waveguide {
     delay: Lagrange5Fd,
     filter: Filter,
     leak: f32,
+    cutoff: f32,
+    cutoff_key: f32,
+    wavelength: f32,
     damper: Damper,
 }
 
@@ -306,6 +310,9 @@ impl Waveguide {
             delay,
             filter: Filter::new(),
             leak: 0.994,
+            cutoff: 0.15,
+            cutoff_key: 0.0,
+            wavelength: wavelength as f32,
             damper: Damper::new(),
         }
     }
@@ -320,10 +327,15 @@ impl Waveguide {
     fn load_parameters(&mut self, parameters: Parameters) {
         self.leak = parameters.leak;
         self.damper.damping = parameters.damper;
-        self.filter.a1 = parameters.cutoff
+        self.cutoff = parameters.cutoff;
+        self.cutoff_key = parameters.cutoff_key;
     }
 
     fn note_on(&mut self) {
+        let follow = (self.wavelength / MIDI_60).powf(self.cutoff_key);
+        let f_cut = self.cutoff.log2() * follow;
+        self.filter.a1 = 1.0 - f_cut.exp2();
+
         self.damper.deactivate()
     }
 
@@ -337,6 +349,7 @@ impl Waveguide {
 
         self.queue.resize(len as _, 0.0);
         self.delay.tune(2.5 + len.fract());
+        self.wavelength = wavelength;
     }
 
     fn tap(&self) -> f32 {
@@ -376,7 +389,7 @@ impl Exciter {
 
     fn from_parameters(parameters: Parameters) -> Self {
         let adsr = Adsr::from_parameters(parameters);
-        let velocity = parameters.velocity.powf(1.5);
+        let velocity = 0.25;
         let noise_ratio = parameters.noise;
 
         let noise = Noise::new();
@@ -394,7 +407,6 @@ impl Exciter {
     fn load_parameters(&mut self, parameters: Parameters) {
         self.adsr.load_parameters(parameters);
         self.oscs.load_parameters(parameters);
-        self.velocity = parameters.velocity.powf(1.5);
         self.noise_ratio = parameters.noise;
     }
 
@@ -445,10 +457,11 @@ impl Synth {
         self.waveguide.load_parameters(parameters);
     }
 
-    fn note_on(&mut self, wavelength: f32) {
+    fn note_on(&mut self, wavelength: f32, velocity: f32) {
         self.exciter.tune(wavelength);
         self.waveguide.tune(wavelength);
 
+        self.exciter.velocity = velocity.powf(1.5);
         self.exciter.adsr.note_on();
         self.waveguide.note_on();
     }
@@ -509,12 +522,12 @@ pub struct Parameters {
     pub sustain: f32,
     pub release: f32,
 
-    pub velocity: f32,
     pub noise: f32,
 
     pub leak: f32,
     pub damper: f32,
     pub cutoff: f32,
+    pub cutoff_key: f32,
 }
 
 struct Engine {
@@ -540,12 +553,12 @@ impl Engine {
             sustain: 0.0,
             release: 10000.0,
 
-            velocity: 0.25,
             noise: 0.15,
 
             leak: 0.994,
             damper: 0.04,
-            cutoff: 0.15,
+            cutoff: 0.8,
+            cutoff_key: 0.5,
         };
 
         let synths = vec![];
@@ -615,10 +628,6 @@ impl Engine {
                     self.parameters.release = release
                 },
 
-            "/velocity" =>
-                if let Some(Ty::Float(velocity)) = args.pop() {
-                    self.parameters.velocity = velocity
-                },
             "/noise" =>
                 if let Some(Ty::Float(noise)) = args.pop() {
                     self.parameters.noise = noise
@@ -636,6 +645,10 @@ impl Engine {
             "/cutoff" =>
                 if let Some(Ty::Float(cutoff)) = args.pop() {
                     self.parameters.cutoff = cutoff
+                },
+            "/cutoff_key" =>
+                if let Some(Ty::Float(cutoff_key)) = args.pop() {
+                    self.parameters.cutoff_key = cutoff_key
                 },
 
             _ => {
@@ -661,17 +674,17 @@ impl Engine {
         use miosc::MioscMessage::*;
 
         match miosc {
-            NoteOn(id, pitch, _) => {
+            NoteOn(id, pitch, vel) => {
                 let reference = self.parameters.sample_rate / MIDI_0;
                 let ratio = (pitch / 12.0).exp2();
 
                 if let Some((_, s)) = self.synths.iter_mut().find(|(i, _)| *i == id) {
-                    s.note_on(reference / ratio);
+                    s.note_on(reference / ratio, vel);
                     return
                 }
 
                 let mut synth = Synth::from_parameters(self.parameters);
-                synth.note_on(reference / ratio);
+                synth.note_on(reference / ratio, vel);
                 self.synths.push((id, synth))
             },
             NoteOff(id) => {
