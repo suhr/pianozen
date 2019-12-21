@@ -740,10 +740,12 @@ fn main() {
     let mut out_port = client.register_port("mono", jack::AudioOut::default()).unwrap();
 
     let (tx, rx) = ::std::sync::mpsc::channel();
+    let rx = std::sync::Mutex::new(rx);
 
     let mut engine = Engine::new(client.sample_rate() as f32);
 
     let process = jack::ClosureProcessHandler::new(move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
+        let rx = rx.lock().unwrap();
         let out = out_port.as_mut_slice(ps);
 
         if let Ok(msg) = rx.try_recv() {
@@ -757,7 +759,7 @@ fn main() {
 
     let active_client = client.activate_async((), process).unwrap();
 
-    let socket = ::std::net::UdpSocket::bind("127.0.0.1:3579").unwrap();
+    let socket = ::std::net::UdpSocket::bind("localhost:3579").unwrap();
 
     loop {
         let msg = read_osc(&socket);
